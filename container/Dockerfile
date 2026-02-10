@@ -59,6 +59,9 @@ RUN printf '#!/bin/bash\nset -e\n[ -f /workspace/env-dir/env ] && export $(cat /
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace
 
+# Create .claude directory for node user (required by Claude Code CLI)
+RUN mkdir -p /home/node/.claude && chown -R node:node /home/node/.claude
+
 # Switch to non-root user (required for --dangerously-skip-permissions)
 USER node
 
