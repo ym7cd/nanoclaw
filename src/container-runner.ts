@@ -1,6 +1,6 @@
 /**
  * Container Runner for NanoClaw
- * Spawns agent execution in Apple Container and handles IPC
+ * Spawns agent execution in Docker or Apple Container and handles IPC
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
@@ -17,6 +17,43 @@ import {
 import { logger } from './logger.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+
+// Detect container runtime at startup
+let containerRuntime: 'docker' | 'container' | null = null;
+
+export function getContainerRuntime(): 'docker' | 'container' {
+  if (containerRuntime) return containerRuntime;
+
+  // Prefer Docker if available and running
+  try {
+    exec('docker info', { timeout: 5000 }, (error) => {
+      if (!error) {
+        containerRuntime = 'docker';
+        logger.info('Using Docker container runtime');
+        return;
+      }
+    });
+  } catch {
+    // Docker not available
+  }
+
+  // Fall back to Apple Container
+  try {
+    exec('which container', { timeout: 5000 }, (error, stdout) => {
+      if (!error && stdout.trim()) {
+        containerRuntime = 'container';
+        logger.info('Using Apple Container runtime');
+        return;
+      }
+    });
+  } catch {
+    // Apple Container not available
+  }
+
+  // Default to docker (will fail at runtime if not available)
+  containerRuntime = 'docker';
+  return containerRuntime;
+}
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -163,7 +200,7 @@ function buildVolumeMounts(
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL'];
     const filteredLines = envContent.split('\n').filter((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) return false;
@@ -205,18 +242,26 @@ function buildVolumeMounts(
   return mounts;
 }
 
-function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
+function buildContainerArgs(mounts: VolumeMount[], containerName: string, runtime: 'docker' | 'container'): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  // Apple Container: --mount for readonly, -v for read-write
-  for (const mount of mounts) {
-    if (mount.readonly) {
-      args.push(
-        '--mount',
-        `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
-      );
-    } else {
-      args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+  if (runtime === 'docker') {
+    // Docker: use -v with :ro suffix for readonly
+    for (const mount of mounts) {
+      const suffix = mount.readonly ? ':ro' : '';
+      args.push('-v', `${mount.hostPath}:${mount.containerPath}${suffix}`);
+    }
+  } else {
+    // Apple Container: --mount for readonly, -v for read-write
+    for (const mount of mounts) {
+      if (mount.readonly) {
+        args.push(
+          '--mount',
+          `type=bind,source=${mount.hostPath},target=${mount.containerPath},readonly`,
+        );
+      } else {
+        args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
+      }
     }
   }
 
@@ -232,6 +277,7 @@ export async function runContainerAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
+  const runtime = getContainerRuntime();
 
   const groupDir = path.join(GROUPS_DIR, group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
@@ -239,12 +285,13 @@ export async function runContainerAgent(
   const mounts = buildVolumeMounts(group, input.isMain);
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
-  const containerArgs = buildContainerArgs(mounts, containerName);
+  const containerArgs = buildContainerArgs(mounts, containerName, runtime);
 
   logger.debug(
     {
       group: group.name,
       containerName,
+      runtime,
       mounts: mounts.map(
         (m) =>
           `${m.hostPath} -> ${m.containerPath}${m.readonly ? ' (ro)' : ''}`,
@@ -258,6 +305,7 @@ export async function runContainerAgent(
     {
       group: group.name,
       containerName,
+      runtime,
       mountCount: mounts.length,
       isMain: input.isMain,
     },
@@ -268,7 +316,7 @@ export async function runContainerAgent(
   fs.mkdirSync(logsDir, { recursive: true });
 
   return new Promise((resolve) => {
-    const container = spawn('container', containerArgs, {
+    const container = spawn(runtime, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
 
@@ -366,8 +414,8 @@ export async function runContainerAgent(
 
     const killOnTimeout = () => {
       timedOut = true;
-      logger.error({ group: group.name, containerName }, 'Container timeout, stopping gracefully');
-      exec(`container stop ${containerName}`, { timeout: 15000 }, (err) => {
+      logger.error({ group: group.name, containerName, runtime }, 'Container timeout, stopping gracefully');
+      exec(`${runtime} stop ${containerName}`, { timeout: 15000 }, (err) => {
         if (err) {
           logger.warn({ group: group.name, containerName, err }, 'Graceful stop failed, force killing');
           container.kill('SIGKILL');

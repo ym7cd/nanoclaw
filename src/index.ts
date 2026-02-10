@@ -20,6 +20,8 @@ import {
   STORE_DIR,
   TIMEZONE,
   TRIGGER_PATTERN,
+  TELEGRAM_ONLY,
+  TELEGRAM_BOT_TOKEN,
 } from './config.js';
 import {
   AvailableGroup,
@@ -54,6 +56,12 @@ import { GroupQueue } from './group-queue.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import {
+  connectTelegram,
+  sendTelegramMessage,
+  setTelegramTyping,
+  stopTelegram,
+} from './telegram.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -90,6 +98,11 @@ function translateJid(jid: string): string {
 }
 
 async function setTyping(jid: string, isTyping: boolean): Promise<void> {
+  if (jid.startsWith('tg:')) {
+    if (isTyping) await setTelegramTyping(jid);
+    return;
+  }
+  if (!sock) return;
   try {
     await sock.sendPresenceUpdate(isTyping ? 'composing' : 'paused', jid);
   } catch (err) {
@@ -184,7 +197,7 @@ function getAvailableGroups(): AvailableGroup[] {
   const registeredJids = new Set(Object.keys(registeredGroups));
 
   return chats
-    .filter((c) => c.jid !== '__group_sync__' && c.jid.endsWith('@g.us'))
+    .filter((c) => c.jid !== '__group_sync__' && (c.jid.endsWith('@g.us') || c.jid.startsWith('tg:')))
     .map((c) => ({
       jid: c.jid,
       name: c.name,
@@ -381,7 +394,14 @@ async function runAgent(
 }
 
 async function sendMessage(jid: string, text: string): Promise<void> {
-  if (!waConnected) {
+  // Route Telegram messages directly (no outgoing queue needed)
+  if (jid.startsWith('tg:')) {
+    await sendTelegramMessage(jid, text);
+    return;
+  }
+
+  // WhatsApp path (with outgoing queue for reconnection)
+  if (!sock || !waConnected) {
     outgoingQueue.push({ jid, text });
     logger.info({ jid, length: text.length, queueSize: outgoingQueue.length }, 'WA disconnected, message queued');
     return;
@@ -989,57 +1009,109 @@ function recoverPendingMessages(): void {
 }
 
 function ensureContainerSystemRunning(): void {
+  // Detect which container runtime is available
+  let useDocker = false;
   try {
-    execSync('container system status', { stdio: 'pipe' });
-    logger.debug('Apple Container system already running');
+    execSync('docker info', { stdio: 'pipe', timeout: 5000 });
+    useDocker = true;
+    logger.info('Using Docker as container runtime');
   } catch {
-    logger.info('Starting Apple Container system...');
     try {
-      execSync('container system start', { stdio: 'pipe', timeout: 30000 });
-      logger.info('Apple Container system started');
-    } catch (err) {
-      logger.error({ err }, 'Failed to start Apple Container system');
+      execSync('container system status', { stdio: 'pipe' });
+      logger.info('Using Apple Container as container runtime');
+    } catch {
+      logger.error('Neither Docker nor Apple Container is available');
       console.error(
         '\n╔════════════════════════════════════════════════════════════════╗',
       );
       console.error(
-        '║  FATAL: Apple Container system failed to start                 ║',
+        '║  FATAL: No container runtime found                            ║',
       );
       console.error(
         '║                                                                ║',
       );
       console.error(
-        '║  Agents cannot run without Apple Container. To fix:           ║',
+        '║  Agents cannot run without a container runtime.               ║',
       );
       console.error(
-        '║  1. Install from: https://github.com/apple/container/releases ║',
+        '║  Either install Docker or Apple Container:                     ║',
       );
       console.error(
-        '║  2. Run: container system start                               ║',
+        '║  - Docker: https://www.docker.com/get-started                 ║',
       );
       console.error(
-        '║  3. Restart NanoClaw                                          ║',
+        '║  - Apple Container: https://github.com/apple/container/releases ║',
       );
       console.error(
         '╚════════════════════════════════════════════════════════════════╝\n',
       );
-      throw new Error('Apple Container system is required but failed to start');
+      throw new Error('No container runtime available');
+    }
+  }
+
+  // Start Apple Container if needed (skip for Docker - it should be running manually)
+  if (!useDocker) {
+    try {
+      execSync('container system status', { stdio: 'pipe' });
+      logger.debug('Apple Container system already running');
+    } catch {
+      logger.info('Starting Apple Container system...');
+      try {
+        execSync('container system start', { stdio: 'pipe', timeout: 30000 });
+        logger.info('Apple Container system started');
+      } catch (err) {
+        logger.error({ err }, 'Failed to start Apple Container system');
+        console.error(
+          '\n╔════════════════════════════════════════════════════════════════╗',
+        );
+        console.error(
+          '║  FATAL: Apple Container system failed to start                 ║',
+        );
+        console.error(
+          '║                                                                ║',
+        );
+        console.error(
+          '║  Agents cannot run without Apple Container. To fix:           ║',
+        );
+        console.error(
+          '║  1. Install from: https://github.com/apple/container/releases ║',
+        );
+        console.error(
+          '║  2. Run: container system start                               ║',
+        );
+        console.error(
+          '║  3. Restart NanoClaw                                          ║',
+        );
+        console.error(
+          '╚════════════════════════════════════════════════════════════════╝\n',
+        );
+        throw new Error('Apple Container system is required but failed to start');
+      }
     }
   }
 
   // Kill and clean up orphaned NanoClaw containers from previous runs
+  const runtimeCmd = useDocker ? 'docker' : 'container';
+  const lsCmd = useDocker ? 'docker ps --format json' : 'container ls --format json';
+  const stopCmd = useDocker ? 'docker stop' : 'container stop';
+
   try {
-    const output = execSync('container ls --format json', {
+    const output = execSync(lsCmd, {
       stdio: ['pipe', 'pipe', 'pipe'],
       encoding: 'utf-8',
     });
-    const containers: { status: string; configuration: { id: string } }[] = JSON.parse(output || '[]');
+    const containers: { status: string; Names?: string; configuration?: { id: string } }[] = JSON.parse(output || '[]');
     const orphans = containers
-      .filter((c) => c.status === 'running' && c.configuration.id.startsWith('nanoclaw-'))
-      .map((c) => c.configuration.id);
+      .filter((c) => {
+        const name = useDocker ? c.Names : c.configuration?.id;
+        return (c.status === 'running' || c.status === 'up') && name && (useDocker ? name.includes('nanoclaw-') : name.startsWith('nanoclaw-'));
+      })
+      .map((c) => useDocker ? c.Names?.replace(/^\//, '') || '' : c.configuration?.id || '')
+      .filter(Boolean);
+
     for (const name of orphans) {
       try {
-        execSync(`container stop ${name}`, { stdio: 'pipe' });
+        execSync(`${stopCmd} ${name}`, { stdio: 'pipe' });
       } catch { /* already stopped */ }
     }
     if (orphans.length > 0) {
@@ -1059,13 +1131,40 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    stopTelegram();
     await queue.shutdown(10000);
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
-  await connectWhatsApp();
+  // Start Telegram bot if configured (independent of WhatsApp)
+  const hasTelegram = !!TELEGRAM_BOT_TOKEN;
+  if (hasTelegram) {
+    await connectTelegram(TELEGRAM_BOT_TOKEN);
+  }
+
+  if (!TELEGRAM_ONLY) {
+    await connectWhatsApp();
+  } else {
+    // Telegram-only mode: start all services that WhatsApp's connection.open normally starts
+    startSchedulerLoop({
+      registeredGroups: () => registeredGroups,
+      getSessions: () => sessions,
+      queue,
+      onProcess: (groupJid, proc, containerName, groupFolder) =>
+        queue.registerProcess(groupJid, proc, containerName, groupFolder),
+      sendMessage,
+      assistantName: ASSISTANT_NAME,
+    });
+    startIpcWatcher();
+    queue.setProcessMessagesFn(processGroupMessages);
+    recoverPendingMessages();
+    startMessageLoop();
+    logger.info(
+      `NanoClaw running (Telegram-only, trigger: @${ASSISTANT_NAME})`,
+    );
+  }
 }
 
 main().catch((err) => {
